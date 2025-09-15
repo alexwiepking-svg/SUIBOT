@@ -2,3 +2,42 @@ cd C:\Users\alex_\sui_rsi_bot
 venv\Scripts\activate
 
 py sui_rsi_bot.py
+
+
+SHA256:7yUObxI5b+MAiFQVT4ltttur65mW0a384BC4VyESKbo
+
+
+
+git clone https://github.com/alexwiepking-svg/SUIBOT.git
+cd sui_rsi_bot
+
+
+git remote add origin https://github.com/alexwiepking-svg/SUIBOT.git
+
+
+git config --global user.email "alexwiepking@gmail.com"
+git config --global user.name "Alex Wiepking"
+
+
+ssh alex_wiepking@hotmail.com@157.180.29.139
+
+git clone https://github.com/alexwiepking-svg/sui_rsi_bot.git
+cd sui_rsi_bot
+
+
+.ssh/id_ed25519.pub
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDbAdHDabiNAUbecFyv9e+r2yAqSSLIX8t6vsrI6G/iT alexwiepking@gmail.com
+
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1417188364574265344/6Bd9bfSA83-BsL2ARD5DVOtnQfAHGGrl5ySMH5cEv2aRT2PzfSG2Pr3pZjSj5Eb8VX5l"  # replace with your webhook
+
+ssh -i C:\Users\alex_\.ssh\hetzner_key root@157.180.29.139
+
+systemctl stop sui_rsi_bot.service
+
+cd ~/SUIBOT
+
+git pull origin main
+
+systemctl restart sui_rsi_bot.service
+
+systemctl status sui_rsi_bot.service

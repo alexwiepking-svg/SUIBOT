@@ -10,23 +10,30 @@ SYMBOL = "SUI/USDT"
 TIMEFRAME = "4h"
 EMA_LENGTH = 50
 RSI_LENGTH = 14
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+ADX_LENGTH = 14
+ATR_LENGTH = 14
+VOL_MA_LENGTH = 20
 
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1417188364574265344/6Bd9bfSA83-BsL2ARD5DVOtnQfAHGGrl5ySMH5cEv2aRT2PzfSG2Pr3pZjSj5Eb8VX5l"
-CHECK_INTERVAL = 60 * 15  # 15 minutes
+CHECK_INTERVAL = 60 * 240  # 4 hours (match timeframe to check after candle close)
 
 # EUR/USD exchange rate
 EUR_USD_RATE = None
 
-# RSI STRATEGY LEVELS
-BUY_ZONE_EXTREME = 30      # All-in signal
-BUY_ZONE_SCALE = 45        # Scaling zone
-SELL_ZONE_SCALE = 55       # Start scaling out
-SELL_ZONE_EXTREME = 70     # All-out signal
-RSI_EXTREME_THRESHOLD = 80 # Emergency exit level
+# Strategy thresholds (simplified)
+BUY_RSI = 35       # Buy below this
+SELL_RSI = 65      # Sell above this
+EMERGENCY_RSI = 80 # Emergency sell
+ADX_MAX = 25       # Only signal in low trend (range-bound)
+VOL_MULTIPLIER = 1.5  # Volume > this * MA
+ATR_MULTIPLIER = 3.0  # For parabolic filter
 
-# Alert tracking to avoid spam
-last_alert_rsi_level = None
+# Tracking
 last_signal_candle = None
+AVAILABLE_CAPITAL = 425.17  # EUR (update this manually if needed)
 
 # Create exchange client
 exchange = ccxt.binance({"enableRateLimit": True})
@@ -66,11 +73,11 @@ def send_alert(message):
     except Exception as e:
         print(f"Failed to send Discord alert: {e}")
 
-def fetch_data():
+def fetch_data(limit=100):
     """Fetch OHLCV and convert to EUR"""
     global EUR_USD_RATE
     try:
-        candles = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=100)
+        candles = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=limit)
     except Exception as e:
         raise RuntimeError(f"Failed to fetch data: {e}")
 
@@ -97,166 +104,82 @@ def get_current_candle_id(df):
     return int(df.iloc[-1]["time"] / 1000)
 
 def detect_parabolic_move(df):
-    """Detect dangerous parabolic moves"""
-    if len(df) < 10:
+    """Detect parabolic moves using ATR (volatility-adjusted)"""
+    if len(df) < ATR_LENGTH + 10:
         return False
 
-    recent_closes = df["close"].tail(10).reset_index(drop=True)
-    if recent_closes.isnull().any():
-        return False
-
+    recent_closes = df["close"].tail(10)
     price_change = (recent_closes.iloc[-1] - recent_closes.iloc[0]) / recent_closes.iloc[0]
-    consecutive_gains = 0
-    for i in range(1, len(recent_closes)):
-        if recent_closes.iloc[i] > recent_closes.iloc[i-1]:
-            consecutive_gains += 1
-        else:
-            break
+    atr = df["ATR"].iloc[-1]
+    avg_price = recent_closes.mean()
 
-    is_parabolic = price_change > 0.40 or consecutive_gains >= 6
+    is_parabolic = abs(price_change) > ATR_MULTIPLIER * (atr / avg_price)
     if is_parabolic:
-        send_alert(f"PARABOLIC MOVE DETECTED! Price up {price_change*100:.1f}% in 10 candles - HIGH RISK ZONE")
+        send_alert(f"PARABOLIC MOVE DETECTED! Change: {price_change*100:.1f}% vs ATR threshold - AVOID TRADES")
     return is_parabolic
-
-def send_rsi_alert(rsi, price_eur):
-    """Send RSI monitoring alerts"""
-    global last_alert_rsi_level
-
-    alert_levels = [80, 75, 70, 65, 60, 55, 45, 40, 35, 30, 25, 20]
-    current_alert_level = None
-    
-    for level in alert_levels:
-        if (level >= 70 and rsi >= level) or (level <= 45 and rsi <= level):
-            current_alert_level = level
-            break
-
-    if current_alert_level and current_alert_level != last_alert_rsi_level:
-        if current_alert_level >= 80:
-            send_alert(f"EXTREME RSI: {rsi:.1f} @ EUR{price_eur:.4f} - EMERGENCY EXIT ZONE!")
-        elif current_alert_level >= 70:
-            send_alert(f"RSI EXTREME: {rsi:.1f} @ EUR{price_eur:.4f} - ALL-OUT SIGNAL (>=70)")
-        elif current_alert_level >= 55:
-            send_alert(f"RSI HIGH: {rsi:.1f} @ EUR{price_eur:.4f} - Start scaling out zone")
-        elif current_alert_level <= 20:
-            send_alert(f"RSI ULTRA-LOW: {rsi:.1f} @ EUR{price_eur:.4f} - EXTREME BUY ZONE!")
-        elif current_alert_level <= 30:
-            send_alert(f"RSI EXTREME: {rsi:.1f} @ EUR{price_eur:.4f} - ALL-IN SIGNAL (<=30)")
-        elif current_alert_level <= 45:
-            send_alert(f"RSI LOW: {rsi:.1f} @ EUR{price_eur:.4f} - Start scaling in zone")
-
-        last_alert_rsi_level = current_alert_level
-
-    # Reset alert level when in neutral zone
-    if 46 <= rsi <= 54:
-        last_alert_rsi_level = None
 
 def analyze(df):
     """Analyze and send signals"""
     global last_signal_candle
 
-    # Calculate indicators
+    # Calculate indicators (using pandas_ta for efficiency)
     try:
         df["EMA"] = ta.ema(df["close"], length=EMA_LENGTH)
         df["RSI"] = ta.rsi(df["close"], length=RSI_LENGTH)
+        macd = ta.macd(df["close"], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
+        df["MACD_HIST"] = macd[f"MACDh_{MACD_FAST}_{MACD_SLOW}_{MACD_SIGNAL}"]
+        adx = ta.adx(df["high"], df["low"], df["close"], length=ADX_LENGTH)
+        df["ADX"] = adx[f"ADX_{ADX_LENGTH}"]
+        df["ATR"] = ta.atr(df["high"], df["low"], df["close"], length=ATR_LENGTH)
+        df["VOL_MA"] = df["volume"].rolling(VOL_MA_LENGTH).mean()
     except Exception as e:
         raise RuntimeError(f"Indicator calculation failed: {e}")
 
-    if df["EMA"].isnull().all() or df["RSI"].isnull().all():
+    if df["EMA"].isnull().any() or df["RSI"].isnull().any() or df["MACD_HIST"].isnull().any() or df["ADX"].isnull().any() or df["ATR"].isnull().any():
         print("Not enough data for indicators yet")
         return
 
     price_eur = float(df["close"].iloc[-1])
     ema_eur = float(df["EMA"].iloc[-1])
     rsi = float(df["RSI"].iloc[-1])
+    macd_hist = float(df["MACD_HIST"].iloc[-1])
+    adx = float(df["ADX"].iloc[-1])
+    volume = float(df["volume"].iloc[-1])
+    vol_ma = float(df["VOL_MA"].iloc[-1])
     current_candle = get_current_candle_id(df)
 
-    # Send RSI level alerts
-    send_rsi_alert(rsi, price_eur)
-
-    # Check for parabolic moves
-    is_parabolic = detect_parabolic_move(df)
-
-    # Avoid duplicate signals on same candle
+    # Avoid duplicate signals
     if current_candle == last_signal_candle:
         return
 
-    # BUY SIGNALS
-    if rsi <= BUY_ZONE_EXTREME and not is_parabolic:
-        if price_eur > ema_eur:
-            msg = [
-                f"BUY SIGNAL - ALL-IN ZONE",
-                f"Price: EUR{price_eur:.4f} | RSI: {rsi:.1f} | EMA: EUR{ema_eur:.4f}",
-                f"Signal: RSI <={BUY_ZONE_EXTREME} + Price above EMA",
-                f"Strategy: Deploy 100% of available capital",
-                f"Your balance: EUR425.17 available"
-            ]
-            send_alert("\n".join(msg))
-            last_signal_candle = current_candle
-    elif rsi <= 35 and not is_parabolic:
-        msg = [
-            f"BUY SIGNAL - Heavy Scale-In",
-            f"Price: EUR{price_eur:.4f} | RSI: {rsi:.1f}",
-            f"Strategy: Deploy 25% of remaining capital"
-        ]
-        send_alert("\n".join(msg))
+    # Check parabolic
+    is_parabolic = detect_parabolic_move(df)
+
+    # Emergency sell
+    if rsi >= EMERGENCY_RSI:
+        msg = f"EMERGENCY SELL! RSI: {rsi:.1f} @ EUR{price_eur:.4f} - Exit all positions immediately"
+        send_alert(msg)
         last_signal_candle = current_candle
-    elif rsi <= 40 and not is_parabolic:
+        return  # Skip other signals
+
+    # Buy signal (aggressive all-in)
+    if (rsi < BUY_RSI and price_eur > ema_eur and macd_hist > 0 and adx < ADX_MAX and
+        volume > VOL_MULTIPLIER * vol_ma and not is_parabolic):
         msg = [
-            f"BUY SIGNAL - Medium Scale-In",
-            f"Price: EUR{price_eur:.4f} | RSI: {rsi:.1f}",
-            f"Strategy: Deploy 15% of remaining capital"
-        ]
-        send_alert("\n".join(msg))
-        last_signal_candle = current_candle
-    elif rsi <= BUY_ZONE_SCALE and not is_parabolic:
-        msg = [
-            f"BUY SIGNAL - Light Scale-In",
-            f"Price: EUR{price_eur:.4f} | RSI: {rsi:.1f}",
-            f"Strategy: Deploy 10% of remaining capital"
+            f"BUY SIGNAL - ALL-IN",
+            f"Price: EUR{price_eur:.4f} | RSI: {rsi:.1f} | MACD Hist: {macd_hist:.2f} | ADX: {adx:.1f}",
+            f"Strategy: Deploy 100% available capital (EUR{AVAILABLE_CAPITAL:.2f})"
         ]
         send_alert("\n".join(msg))
         last_signal_candle = current_candle
 
-    # SELL SIGNALS
-    if rsi >= RSI_EXTREME_THRESHOLD:
+    # Sell signal (all-out)
+    elif (rsi > SELL_RSI and macd_hist < 0 and adx < ADX_MAX and
+          volume > VOL_MULTIPLIER * vol_ma):
         msg = [
-            f"SELL SIGNAL - EMERGENCY EXIT",
-            f"Price: EUR{price_eur:.4f} | RSI: {rsi:.1f}",
-            f"Signal: RSI >={RSI_EXTREME_THRESHOLD} - EXTREME OVERBOUGHT",
-            f"Strategy: Exit 100% immediately"
-        ]
-        send_alert("\n".join(msg))
-        last_signal_candle = current_candle
-    elif rsi >= SELL_ZONE_EXTREME:
-        msg = [
-            f"SELL SIGNAL - ALL-OUT ZONE",
-            f"Price: EUR{price_eur:.4f} | RSI: {rsi:.1f} | EMA: EUR{ema_eur:.4f}",
-            f"Signal: RSI >={SELL_ZONE_EXTREME}",
+            f"SELL SIGNAL - ALL-OUT",
+            f"Price: EUR{price_eur:.4f} | RSI: {rsi:.1f} | MACD Hist: {macd_hist:.2f} | ADX: {adx:.1f}",
             f"Strategy: Exit 100% of position"
-        ]
-        send_alert("\n".join(msg))
-        last_signal_candle = current_candle
-    elif rsi >= 66:
-        msg = [
-            f"SELL SIGNAL - Heavy Scale-Out",
-            f"Price: EUR{price_eur:.4f} | RSI: {rsi:.1f}",
-            f"Strategy: Sell 40% of position"
-        ]
-        send_alert("\n".join(msg))
-        last_signal_candle = current_candle
-    elif rsi >= 61:
-        msg = [
-            f"SELL SIGNAL - Medium Scale-Out",
-            f"Price: EUR{price_eur:.4f} | RSI: {rsi:.1f}",
-            f"Strategy: Sell 25% of position"
-        ]
-        send_alert("\n".join(msg))
-        last_signal_candle = current_candle
-    elif rsi >= SELL_ZONE_SCALE:
-        msg = [
-            f"SELL SIGNAL - Light Scale-Out",
-            f"Price: EUR{price_eur:.4f} | RSI: {rsi:.1f}",
-            f"Strategy: Sell 15% of position"
         ]
         send_alert("\n".join(msg))
         last_signal_candle = current_candle
@@ -264,20 +187,20 @@ def analyze(df):
 # === MAIN LOOP ===
 if __name__ == "__main__":
     startup_msg = [
-        f"SUI RSI SIGNAL BOT STARTED",
-        f"Mode: SIGNALS ONLY (No automatic trading)",
-        f"Available Capital: EUR425.17",
-        f"Strategy: ALL-IN at RSI <=30, ALL-OUT at RSI >=70",
-        f"Scaling: Gradual entries 30-45, gradual exits 55-70",
-        f"Safety: Parabolic move detection, Emergency exit at RSI >=80",
-        f"Monitoring: Every {CHECK_INTERVAL/60:.0f} minutes",
-        f"Prices shown in EUR (converted from USDT)"
+        f"SUI SIGNAL BOT v2 STARTED",
+        f"Mode: SIGNALS ONLY (No auto-trading)",
+        f"Available Capital: EUR{AVAILABLE_CAPITAL:.2f}",
+        f"Strategy: All-in buys below RSI {BUY_RSI} with confirmations, all-out sells above {SELL_RSI}",
+        f"Filters: MACD momentum, ADX range-bound, high volume, no parabolas",
+        f"Emergency: Sell at RSI >= {EMERGENCY_RSI}",
+        f"Monitoring: Every {CHECK_INTERVAL/3600:.0f} hours (after candle close)",
+        f"Prices in EUR"
     ]
     send_alert("\n".join(startup_msg))
 
     while True:
         try:
-            df = fetch_data()
+            df = fetch_data(limit=200)  # More data for indicators
             analyze(df)
         except Exception as e:
             print("Error in main loop:", e)
@@ -287,3 +210,86 @@ if __name__ == "__main__":
             except Exception:
                 pass
         time.sleep(CHECK_INTERVAL)
+
+# === BACKTEST (Run locally to check profitability) ===
+def backtest_strategy():
+    """Simulate trades on historical data"""
+    df_hist = fetch_data(limit=1000)  # Fetch 1+ year of data
+    # Calculate indicators (same as analyze)
+    df_hist["EMA"] = ta.ema(df_hist["close"], length=EMA_LENGTH)
+    df_hist["RSI"] = ta.rsi(df_hist["close"], length=RSI_LENGTH)
+    macd = ta.macd(df_hist["close"], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
+    df_hist["MACD_HIST"] = macd[f"MACDh_{MACD_FAST}_{MACD_SLOW}_{MACD_SIGNAL}"]
+    adx = ta.adx(df_hist["high"], df_hist["low"], df_hist["close"], length=ADX_LENGTH)
+    df_hist["ADX"] = adx[f"ADX_{ADX_LENGTH}"]
+    df_hist["ATR"] = ta.atr(df_hist["high"], df_hist["low"], df_hist["close"], length=ATR_LENGTH)
+    df_hist["VOL_MA"] = df_hist["volume"].rolling(VOL_MA_LENGTH).mean()
+
+    start_capital = AVAILABLE_CAPITAL
+    capital = start_capital
+    position = 0.0  # SUI amount
+    trades = []
+    wins = 0
+
+    for i in range(len(df_hist)):
+        row = df_hist.iloc[i]
+
+        if pd.isna(row["RSI"]) or pd.isna(row["MACD_HIST"]) or pd.isna(row["ADX"]):  # Skip early rows
+            continue
+
+        # Parabolic check
+        if i >= 10:
+            recent_closes = df_hist["close"].iloc[i-9:i+1]
+            price_change = (row["close"] - recent_closes.iloc[0]) / recent_closes.iloc[0]
+            is_parabolic = abs(price_change) > ATR_MULTIPLIER * (row["ATR"] / row["close"])
+        else:
+            is_parabolic = False
+
+        # Emergency sell
+        if position > 0 and row["RSI"] >= EMERGENCY_RSI:
+            sell_price = row["close"]
+            capital = position * sell_price
+            profit = capital - start_capital if trades else 0  # Simplified
+            trades.append({"type": "emergency_sell", "price": sell_price, "profit": profit})
+            if profit > 0: wins += 1
+            position = 0
+            continue
+
+        # Buy
+        if position == 0 and row["RSI"] < BUY_RSI and row["close"] > row["EMA"] and row["MACD_HIST"] > 0 and row["ADX"] < ADX_MAX and row["volume"] > VOL_MULTIPLIER * row["VOL_MA"] and not is_parabolic:
+            buy_price = row["close"]
+            position = capital / buy_price  # All-in
+            capital = 0
+            trades.append({"type": "buy", "price": buy_price})
+
+        # Sell
+        elif position > 0 and row["RSI"] > SELL_RSI and row["MACD_HIST"] < 0 and row["ADX"] < ADX_MAX and row["volume"] > VOL_MULTIPLIER * row["VOL_MA"]:
+            sell_price = row["close"]
+            capital = position * sell_price
+            profit = (sell_price - trades[-1]["price"]) / trades[-1]["price"] * 100  # % profit
+            trades.append({"type": "sell", "price": sell_price, "profit": profit})
+            if profit > 0: wins += 1
+            position = 0
+
+    # Close any open position
+    if position > 0:
+        final_price = df_hist["close"].iloc[-1]
+        capital = position * final_price
+        profit = (final_price - trades[-1]["price"]) / trades[-1]["price"] * 100
+        trades.append({"type": "final_sell", "price": final_price, "profit": profit})
+        if profit > 0: wins += 1
+
+    final_capital = capital
+    num_trades = len([t for t in trades if t["type"] in ["sell", "emergency_sell", "final_sell"]])
+    win_rate = (wins / num_trades * 100) if num_trades > 0 else 0
+    total_return = (final_capital - start_capital) / start_capital * 100
+
+    print(f"Backtest Results:")
+    print(f"Start Capital: EUR{start_capital:.2f}")
+    print(f"Final Capital: EUR{final_capital:.2f}")
+    print(f"Total Return: {total_return:.2f}%")
+    print(f"Trades: {num_trades} | Win Rate: {win_rate:.2f}%")
+    print(f"Trades details: {trades}")
+
+# Uncomment to run backtest
+# backtest_strategy()
