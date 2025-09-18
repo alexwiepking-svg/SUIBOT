@@ -21,12 +21,26 @@ POSITION_PCT = 1.0
 AUTO_EXECUTE = False
 
 # Trade rules
-BUY_ZONE = 40
+BUY_ZONE_DEEP = 30
+BUY_ZONE_MEDIUM = 40
+BUY_ZONE_LIGHT = 50
 DEEP_RSI = 30
 TP1 = 0.06
 TP2 = 0.15
 SL_PCT = 0.05
 EMA_SLOPE_LOOKBACK = 3
+
+SCALE_BUY = {
+    "deep": 0.75,    # RSI ≤ 30 → 75% of available funds
+    "medium": 0.25,  # RSI 31–40 → 25%
+    "light": 0.10    # RSI 41–50 & above EMA → 10%
+}
+
+SCALE_SELL = {
+    "TP1": 0.30,   # Sell 30% at TP1 (~6%)
+    "TP2": 0.50,   # Sell 50% at TP2 (~15%)
+    "RSI70": 0.20  # Sell remaining 20% if RSI ≥ 70
+}
 
 # === STATE ===
 balance_usdt = START_FUNDS
@@ -51,6 +65,7 @@ def fetch_data():
     df["close"] = df["close"].astype(float)
     return df
 
+# === TRADE LOGIC ===
 def analyze(df):
     global in_position, entry_price, position_qty, balance_usdt
 
@@ -65,45 +80,64 @@ def analyze(df):
     ema_then = df["EMA"].iloc[-1 - EMA_SLOPE_LOOKBACK]
     ema_slope = (ema - ema_then) / ema_then if ema_then and not math.isnan(ema_then) else 0.0
 
-    # --- BUY LOGIC ---
-    if not in_position:
-        if prev_rsi < DEEP_RSI and rsi >= DEEP_RSI:
-            execute_buy(price, rsi, "Deep oversold bounce (<30 → up)")
-        elif prev_rsi < BUY_ZONE and rsi >= BUY_ZONE and ema_slope >= 0:
-            execute_buy(price, rsi, f"RSI bounce {prev_rsi:.2f}→{rsi:.2f} with EMA slope {ema_slope:.4f}")
-        elif prev_rsi < 50 and rsi >= 50 and price > ema and ema_slope > 0.001:
-            execute_buy(price, rsi, "Momentum continuation (RSI >50 & above EMA)")
+    # --- BUY LOGIC (scaled) ---
+    if rsi <= BUY_ZONE_DEEP:
+        execute_buy(price, rsi, SCALE_BUY["deep"], "Deep oversold bounce (<30)")
+    elif BUY_ZONE_DEEP < rsi <= BUY_ZONE_MEDIUM:
+        execute_buy(price, rsi, SCALE_BUY["medium"], f"Moderate oversold ({prev_rsi:.2f}->{rsi:.2f})")
+    elif BUY_ZONE_MEDIUM < rsi <= BUY_ZONE_LIGHT and price > ema and ema_slope > 0:
+        execute_buy(price, rsi, SCALE_BUY["light"], "Momentum continuation (RSI >40 & above EMA)")
 
-    # --- SELL LOGIC ---
+    # --- SELL LOGIC (scaled) ---
     if in_position:
-        entry = entry_price
-        tp1_price = entry * (1 + TP1)
-        tp2_price = entry * (1 + TP2)
-        sl_price = entry * (1 - SL_PCT)
+        tp1_price = entry_price * (1 + TP1)
+        tp2_price = entry_price * (1 + TP2)
+        sl_price = entry_price * (1 - SL_PCT)
 
-        if price <= sl_price:
-            execute_sell(price, rsi, f"Stop-loss hit ({price:.4f} ≤ {sl_price:.4f})")
-        elif price >= tp2_price:
-            execute_sell(price, rsi, f"Take-profit 2 hit (+15%) @ {price:.4f}")
-        elif prev_rsi > 70 and rsi <= 70:
-            execute_sell(price, rsi, f"RSI downcross from overbought ({prev_rsi:.2f}→{rsi:.2f})")
+        # TP1
+        if price >= tp1_price and position_qty > 0:
+            sell_portion(price, SCALE_SELL["TP1"], f"TP1 reached +{TP1*100:.0f}%")
 
-def execute_buy(price, rsi, reason):
+        # TP2
+        if price >= tp2_price and position_qty > 0:
+            sell_portion(price, SCALE_SELL["TP2"], f"TP2 reached +{TP2*100:.0f}%")
+
+        # RSI overbought exit
+        if rsi >= 70 and position_qty > 0:
+            sell_portion(price, SCALE_SELL["RSI70"], f"RSI ≥ 70 ({prev_rsi:.2f}->{rsi:.2f})")
+
+        # Stop-loss on remaining
+        if price <= sl_price and position_qty > 0:
+            sell_portion(price, 1.0, f"Stop-loss hit ({price:.4f} ≤ {sl_price:.4f})")
+
+def execute_buy(price, rsi, portion, reason):
     global in_position, entry_price, position_qty, balance_usdt
 
-    usdt_alloc = balance_usdt * POSITION_PCT if AUTO_EXECUTE else START_FUNDS * POSITION_PCT
+    if portion <= 0:
+        return
+
+    usdt_alloc = balance_usdt * portion if AUTO_EXECUTE else START_FUNDS * portion
+    if usdt_alloc <= 0:
+        return
+
     qty = usdt_alloc / price
 
     if AUTO_EXECUTE:
         balance_usdt -= usdt_alloc
 
-    entry_price = price
-    position_qty = qty
-    in_position = True
+    # Update position tracking
+    if in_position:
+        # Add to existing position
+        entry_price = (entry_price * position_qty + price * qty) / (position_qty + qty)
+        position_qty += qty
+    else:
+        entry_price = price
+        position_qty = qty
+        in_position = True
 
-    tp1_price = price * (1 + TP1)
-    tp2_price = price * (1 + TP2)
-    sl_price = price * (1 - SL_PCT)
+    tp1_price = entry_price * (1 + TP1)
+    tp2_price = entry_price * (1 + TP2)
+    sl_price = entry_price * (1 - SL_PCT)
 
     msg = [
         f"🟢 BUY — {reason}",
@@ -111,33 +145,34 @@ def execute_buy(price, rsi, reason):
         f"Allocated: {usdt_alloc:.2f} USDT → ~{qty:.4f} SUI",
         f"Targets: TP1 {tp1_price:.4f} (+6%), TP2 {tp2_price:.4f} (+15%)",
         f"Stop-loss: {sl_price:.4f} (−5%)",
+        f"(New position: {position_qty:.4f} SUI @ avg {entry_price:.4f})"
     ]
-    if AUTO_EXECUTE:
-        msg.append(f"📊 Balance after buy: {balance_usdt:.2f} USDT (holding {qty:.4f})")
-    else:
-        msg.append("(Manual mode: balance not updated)")
     send_alert("\n".join(msg))
 
-def execute_sell(price, rsi, reason):
-    global in_position, entry_price, position_qty, balance_usdt
+def sell_portion(price, fraction, reason):
+    """Sell a fraction of current position."""
+    global in_position, position_qty, balance_usdt, entry_price
 
-    qty = position_qty
-    proceeds = qty * price
+    qty_to_sell = position_qty * fraction
+    if qty_to_sell <= 0:
+        return
 
+    proceeds = qty_to_sell * price
     if AUTO_EXECUTE:
         balance_usdt += proceeds
 
-    in_position = False
-    entry_price = None
-    position_qty = 0.0
+    position_qty -= qty_to_sell
+    if position_qty <= 0:
+        in_position = False
+        entry_price = None
 
     msg = [
         f"🔴 SELL — {reason}",
-        f"Price: {price:.4f} | RSI: {rsi:.2f}",
-        f"Closed position: ~{qty:.4f} SUI → {proceeds:.2f} USDT",
+        f"Price: {price:.4f}",
+        f"Sold {qty_to_sell:.4f} SUI → {proceeds:.2f} USDT",
     ]
     if AUTO_EXECUTE:
-        msg.append(f"📊 Balance now: {balance_usdt:.2f} USDT")
+        msg.append(f"📊 Balance now: {balance_usdt:.2f} USDT, remaining {position_qty:.4f} SUI")
     else:
         msg.append("(Manual mode: balance not updated)")
     send_alert("\n".join(msg))
