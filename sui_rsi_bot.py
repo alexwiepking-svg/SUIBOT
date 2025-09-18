@@ -11,7 +11,7 @@ TIMEFRAME = "4h"
 EMA_LENGTH = 50
 RSI_LENGTH = 14
 
-DISCORD_WEBHOOK = "https://discord.com/api/webhooks/XXXXXXXXXXXX"  # replace with your webhook
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1417188364574265344/6Bd9bfSA83-BsL2ARD5DVOtnQfAHGGrl5ySMH5cEv2aRT2PzfSG2Pr3pZjSj5Eb8VX5l"  # replace with your webhook
 
 CHECK_INTERVAL = 60 * 15  # seconds between checks
 
