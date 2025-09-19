@@ -1,0 +1,5 @@
+ccxt
+pandas
+numpy
+pandas_ta
+backtrader
