@@ -11,6 +11,9 @@ TIMEFRAME = "4h"
 EMA_LENGTH = 50
 RSI_LENGTH = 14
 
+# EUR/USD exchange rate (will be fetched automatically)
+EUR_USD_RATE = None
+
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1417188364574265344/6Bd9bfSA83-BsL2ARD5DVOtnQfAHGGrl5ySMH5cEv2aRT2PzfSG2Pr3pZjSj5Eb8VX5l"
 CHECK_INTERVAL = 60 * 15  # 15 minutes
 
@@ -18,11 +21,13 @@ CHECK_INTERVAL = 60 * 15  # 15 minutes
 START_FUNDS = 409.64
 AUTO_EXECUTE = False  # Keep as paper trading for now!
 
-# CONSERVATIVE SETTINGS (learned from 2025 failure)
-BUY_ZONE_DEEP = 30      # Full buy zone
-BUY_ZONE_MOMENTUM = 45  # Reduced from 55! More conservative momentum
-TP1 = 0.06              # 6% - this worked well
-TP2 = 0.15              # 15% - this worked well
+# EXTREME RSI STRATEGY - All-in/All-out at key levels
+BUY_ZONE_EXTREME = 30      # 100% all-in zone
+BUY_ZONE_SCALE = 45        # Gradual scaling zone (30-45)
+SELL_ZONE_SCALE = 55       # Start scaling out zone (55-70)  
+SELL_ZONE_EXTREME = 70     # 100% fully out zone
+TP1 = 0.06                 # 6% - keep for additional exits
+TP2 = 0.15                 # 15% - keep for additional exits
 
 # 🛡️ CRASH PROTECTION FEATURES
 ENABLE_BUBBLE_PROTECTION = True
@@ -32,25 +37,29 @@ MAX_POSITION_SIZE = 0.15        # Only applies to momentum buys now!
 DAILY_LOSS_LIMIT = 0.08         # Stop trading if down 8% in 24h
 MAX_DRAWDOWN_LIMIT = 0.25       # Emergency exit if down 25% from peak
 
-# Position sizing (much more conservative)
+# Position sizing for extreme RSI strategy
 SCALE_BUY = {
-    "deep": 0.50,           # 50% for deep oversold - NOT capped by MAX_POSITION_SIZE
-    "momentum": 0.15        # 15% for momentum - capped by MAX_POSITION_SIZE
+    "extreme": 1.0,         # 100% all-in at RSI ≤30
+    "scale_heavy": 0.25,    # 25% at RSI 31-35 
+    "scale_medium": 0.15,   # 15% at RSI 36-40
+    "scale_light": 0.10     # 10% at RSI 41-45
 }
 
 SCALE_SELL = {
-    "TP1": 0.25,           # Sell 25% at TP1 (6%) - reduced from 40%
-    "TP2": 0.35,           # Sell 35% at TP2 (15%) - reduced from 60%
-    "RSI_WARNING": 0.30,   # Sell 30% at RSI 68 (from deep oversold)
-    "RSI_DANGER": 1.0      # Full exit at RSI 75
+    "TP1": 0.20,            # 20% at +6% gain
+    "TP2": 0.25,            # 25% at +15% gain  
+    "scale_light": 0.15,    # 15% at RSI 55-60
+    "scale_medium": 0.25,   # 25% at RSI 61-65
+    "scale_heavy": 0.40,    # 40% at RSI 66-69
+    "extreme": 1.0          # 100% at RSI ≥70
 }
 
 EMA_SLOPE_LOOKBACK = 3
 
 # === STATE TRACKING ===
-balance_usdt = 0.0  # All funds deployed
+balance_eur = 0.0  # All funds deployed in EUR
 in_position = True
-entry_price = 409.64 / 142.2382  # €2.88 per SUI
+entry_price_eur = 409.64 / 142.2382  # €2.88 per SUI
 position_qty = 142.2382
 entry_time = time.time()  # Set to current time
 daily_pnl = 0.0
@@ -60,7 +69,31 @@ last_trade_candle = None
 last_alert_rsi_level = None  # Track last RSI alert to avoid spam
 
 # === HELPERS ===
-def send_alert(message):
+def get_eur_usd_rate():
+    """Fetch current EUR/USD exchange rate"""
+    try:
+        # Using exchangerate-api.com (free tier)
+        response = requests.get("https://api.exchangerate-api.com/v4/latest/EUR", timeout=10)
+        data = response.json()
+        return data['rates']['USD']
+    except Exception as e:
+        print(f"Failed to fetch EUR/USD rate: {e}")
+        # Fallback to approximate rate if API fails
+        return 1.10
+
+def usd_to_eur(usd_amount):
+    """Convert USD to EUR"""
+    global EUR_USD_RATE
+    if EUR_USD_RATE is None:
+        EUR_USD_RATE = get_eur_usd_rate()
+    return usd_amount / EUR_USD_RATE
+
+def eur_to_usd(eur_amount):
+    """Convert EUR to USD"""
+    global EUR_USD_RATE
+    if EUR_USD_RATE is None:
+        EUR_USD_RATE = get_eur_usd_rate()
+    return eur_amount * EUR_USD_RATE
     tag = "[SUI CRASH-PROTECTED]"
     full_msg = f"{tag} {message}"
     print(full_msg)
@@ -144,7 +177,45 @@ def get_current_candle_id(df):
         return None
     return int(df.iloc[-1]["time"] / 1000)  # Convert to seconds
 
-def send_rsi_monitoring_alert(rsi, price):
+def get_buy_allocation(rsi, balance_remaining):
+    """Calculate buy allocation based on RSI level"""
+    if rsi <= BUY_ZONE_EXTREME:
+        # ALL-IN at extreme oversold
+        return balance_remaining, "🔥 EXTREME ALL-IN (RSI ≤30)"
+    elif rsi <= 35:
+        # Heavy scaling 31-35
+        allocation = balance_remaining * SCALE_BUY["scale_heavy"]
+        return allocation, f"📈 Heavy scale-in (RSI {rsi:.1f})"
+    elif rsi <= 40:
+        # Medium scaling 36-40
+        allocation = balance_remaining * SCALE_BUY["scale_medium"] 
+        return allocation, f"📊 Medium scale-in (RSI {rsi:.1f})"
+    elif rsi <= BUY_ZONE_SCALE:
+        # Light scaling 41-45
+        allocation = balance_remaining * SCALE_BUY["scale_light"]
+        return allocation, f"📉 Light scale-in (RSI {rsi:.1f})"
+    else:
+        return 0, ""
+
+def get_sell_allocation(rsi, position_remaining):
+    """Calculate sell allocation based on RSI level"""
+    if rsi >= SELL_ZONE_EXTREME:
+        # ALL-OUT at extreme overbought
+        return position_remaining, "🚨 EXTREME ALL-OUT (RSI ≥70)"
+    elif rsi >= 66:
+        # Heavy scaling 66-69
+        allocation = position_remaining * SCALE_SELL["scale_heavy"]
+        return allocation, f"📈 Heavy scale-out (RSI {rsi:.1f})"
+    elif rsi >= 61:
+        # Medium scaling 61-65  
+        allocation = position_remaining * SCALE_SELL["scale_medium"]
+        return allocation, f"📊 Medium scale-out (RSI {rsi:.1f})"
+    elif rsi >= SELL_ZONE_SCALE:
+        # Light scaling 55-60
+        allocation = position_remaining * SCALE_SELL["scale_light"]
+        return allocation, f"📉 Light scale-out (RSI {rsi:.1f})"
+    else:
+        return 0, ""
     """Send RSI monitoring alerts for key levels"""
     global last_alert_rsi_level
     
@@ -161,11 +232,11 @@ def send_rsi_monitoring_alert(rsi, price):
     # Only send alert if we hit a new lower level
     if current_alert_level and current_alert_level != last_alert_rsi_level:
         if current_alert_level == 40:
-            send_alert(f"👀 RSI WATCH: {rsi:.1f} @ ${price:.4f} - Getting oversold")
+            send_alert(f"👀 RSI WATCH: {rsi:.1f} @ €{price_eur:.4f} - Getting oversold")
         elif current_alert_level == 35:
-            send_alert(f"⚠️ RSI ALERT: {rsi:.1f} @ ${price:.4f} - Approaching deep zone (≤30)")
+            send_alert(f"⚠️ RSI ALERT: {rsi:.1f} @ €{price_eur:.4f} - Approaching deep zone (≤30)")
         elif current_alert_level == 32:
-            send_alert(f"🔥 RSI CRITICAL: {rsi:.1f} @ ${price:.4f} - Very close to deep buy zone!")
+            send_alert(f"🔥 RSI CRITICAL: {rsi:.1f} @ €{price_eur:.4f} - Very close to deep buy zone!")
         
         last_alert_rsi_level = current_alert_level
     
@@ -175,26 +246,24 @@ def send_rsi_monitoring_alert(rsi, price):
 
 # === IMPROVED TRADE LOGIC ===
 def analyze(df):
-    global in_position, entry_price, position_qty, balance_usdt, entry_time, daily_pnl, last_trade_candle
+    global in_position, entry_price_eur, position_qty, balance_eur, entry_time, daily_pnl, last_trade_candle
 
     df["EMA"] = ta.ema(df["close"], length=EMA_LENGTH)
     df["RSI"] = ta.rsi(df["close"], length=RSI_LENGTH)
 
-    price = df["close"].iloc[-1]
-    ema = df["EMA"].iloc[-1]
+    price_eur = df["close"].iloc[-1]  # Already converted to EUR
+    ema_eur = df["EMA"].iloc[-1]
     rsi = df["RSI"].iloc[-1]
     prev_rsi = df["RSI"].iloc[-2] if len(df) > 1 else rsi
 
-    # Send RSI monitoring alerts
-    # Reduced monitoring since we're already positioned
-    if position_qty < START_FUNDS * 0.8:  # Only alert if less than 80% positioned
-        send_rsi_monitoring_alert(rsi, price)
+    # Send RSI monitoring alerts - now covers both buy and sell zones
+    send_rsi_monitoring_alert(rsi, price_eur)
 
     # Get current candle ID to prevent multiple trades per candle
     current_candle = get_current_candle_id(df)
     
     # Calculate current portfolio value
-    current_portfolio_value = balance_usdt + (position_qty * price)
+    current_portfolio_value = balance_eur + (position_qty * price_eur)
     
     # === SAFETY CHECKS ===
     # 1. Daily loss limit
@@ -216,61 +285,132 @@ def analyze(df):
     
     # 4. Extreme RSI protection
     if rsi >= RSI_EXTREME_THRESHOLD and in_position:
-        sell_portion(price, 1.0, f"🚨 EXTREME RSI EXIT ({rsi:.1f} ≥ {RSI_EXTREME_THRESHOLD})")
+        sell_portion(price_eur, 1.0, f"🚨 EXTREME RSI EXIT ({rsi:.1f} ≥ {RSI_EXTREME_THRESHOLD})")
         return
 
     # EMA slope calculation
     if len(df) > EMA_SLOPE_LOOKBACK:
         ema_then = df["EMA"].iloc[-1 - EMA_SLOPE_LOOKBACK]
-        ema_slope = (ema - ema_then) / ema_then if ema_then and not math.isnan(ema_then) else 0.0
+        ema_slope = (ema_eur - ema_then) / ema_then if ema_then and not math.isnan(ema_then) else 0.0
     else:
         ema_slope = 0
 
-    # === FIXED BUY LOGIC ===
-    if current_candle != last_trade_candle:  # One trade per candle
+    # === EXTREME RSI BUY LOGIC ===
+    if current_candle != last_trade_candle and balance_eur > 10:  # Only if we have funds
         
-        # DEEP OVERSOLD BUY (RSI ≤ 30) - FULL 50% allocation, no MAX_POSITION_SIZE cap
-        if rsi <= BUY_ZONE_DEEP and not is_parabolic:
-            execute_buy(price, rsi, SCALE_BUY["deep"], "🔥 Deep oversold entry (RSI ≤30)", is_deep_buy=True)
+        buy_amount, buy_reason = get_buy_allocation(rsi, balance_eur)
+        
+        if buy_amount > 10 and not is_parabolic:  # Minimum €10 trade
+            # For extreme all-in (RSI ≤30), no additional checks needed
+            # For scaling buys, add EMA trend confirmation
+            if rsi <= BUY_ZONE_EXTREME or (price_eur > ema_eur and ema_slope > 0):
+                execute_scaled_buy(price_eur, rsi, buy_amount, buy_reason)
+                last_trade_candle = current_candle
+
+    # === EXTREME RSI SELL LOGIC ===
+    if in_position and entry_price_eur and position_qty > 0:
+        
+        # 1. RSI-based scaling sells (priority over TP levels)
+        sell_amount, sell_reason = get_sell_allocation(rsi, position_qty)
+        
+        if sell_amount > 0.001:  # Minimum position size
+            sell_scaled_portion(price_eur, sell_amount, sell_reason)
             last_trade_candle = current_candle
         
-        # MOMENTUM BUY (RSI 30-45) - Capped at 15% by MAX_POSITION_SIZE
-        elif (BUY_ZONE_DEEP < rsi <= BUY_ZONE_MOMENTUM and 
-              price > ema and ema_slope > 0 and not is_parabolic):
-            # Additional safety: reduce size if RSI is higher in the range
-            size_multiplier = max(0.5, (BUY_ZONE_MOMENTUM - rsi) / (BUY_ZONE_MOMENTUM - BUY_ZONE_DEEP))
-            adjusted_size = SCALE_BUY["momentum"] * size_multiplier
+        # 2. Traditional TP levels (only if no RSI sell triggered)
+        elif current_candle != last_trade_candle:
+            tp1_price = entry_price_eur * (1 + TP1)
+            tp2_price = entry_price_eur * (1 + TP2)
             
-            execute_buy(price, rsi, adjusted_size, f"📈 Conservative momentum ({rsi:.1f}, size: {adjusted_size*100:.0f}%)", is_deep_buy=False)
-            last_trade_candle = current_candle
+            # Take Profit 1 
+            if price_eur >= tp1_price:
+                sell_amount = position_qty * SCALE_SELL["TP1"]
+                sell_scaled_portion(price_eur, sell_amount, f"🎯 TP1 reached +{TP1*100:.0f}%")
+                last_trade_candle = current_candle
+            # Take Profit 2
+            elif price_eur >= tp2_price:
+                sell_amount = position_qty * SCALE_SELL["TP2"] 
+                sell_scaled_portion(price_eur, sell_amount, f"🎯 TP2 reached +{TP2*100:.0f}%")
+                last_trade_candle = current_candle
 
-    # === IMPROVED SELL LOGIC ===
-    if in_position and entry_price:
-        tp1_price = entry_price * (1 + TP1)
-        tp2_price = entry_price * (1 + TP2)
+def execute_scaled_buy(price_eur, rsi, eur_amount, reason):
+    global in_position, entry_price_eur, position_qty, balance_eur, entry_time
+
+    if eur_amount <= 10:  # Minimum trade size
+        return
+
+    qty = eur_amount / price_eur
+
+    if AUTO_EXECUTE:
+        balance_eur -= eur_amount
+
+    # Position tracking
+    if in_position:
+        # Average into position
+        new_total_value = (entry_price_eur * position_qty) + (price_eur * qty)
+        new_total_qty = position_qty + qty
+        entry_price_eur = new_total_value / new_total_qty
+        position_qty = new_total_qty
+    else:
+        entry_price_eur = price_eur
+        position_qty = qty
+        in_position = True
+        entry_time = time.time()
+
+    tp1_price = entry_price_eur * (1 + TP1)
+    tp2_price = entry_price_eur * (1 + TP2)
+
+    msg = [
+        f"✅ BUY — {reason}",
+        f"💰 Price: €{price_eur:.4f} | RSI: {rsi:.1f}",
+        f"💵 Size: €{eur_amount:.2f} → {qty:.2f} SUI",
+        f"🎯 Targets: TP1 €{tp1_price:.4f} (+6%) | TP2 €{tp2_price:.4f} (+15%)",
+        f"🛡️ RSI Exits: Scale 55-70, ALL-OUT ≥70",
+        f"📊 Position: {position_qty:.2f} SUI @ €{entry_price_eur:.4f}",
+        f"💰 Remaining: €{balance_eur:.2f}"
+    ]
+    send_alert("\n".join(msg))
+
+def sell_scaled_portion(price_eur, qty_to_sell, reason):
+    global in_position, position_qty, balance_eur, entry_price_eur, entry_time, daily_pnl
+
+    if qty_to_sell <= 0:
+        return
+
+    proceeds = qty_to_sell * price_eur
+    if AUTO_EXECUTE:
+        balance_eur += proceeds
+
+    pnl = (price_eur - entry_price_eur) * qty_to_sell if entry_price_eur else 0
+    pnl_pct = (price_eur - entry_price_eur) / entry_price_eur * 100 if entry_price_eur else 0
+    
+    # Update daily P&L tracking
+    daily_pnl += pnl
+
+    position_qty -= qty_to_sell
+    
+    if position_qty <= 0.001:
+        in_position = False
+        entry_price_eur = None
+        entry_time = None
+        position_qty = 0
+
+    hours_held = (time.time() - entry_time) / 3600 if entry_time else 0
+
+    msg = [
+        f"💸 SELL — {reason}",
+        f"💰 Price: €{price_eur:.4f}",
+        f"📦 Sold: {qty_to_sell:.2f} SUI → €{proceeds:.2f}",
+        f"📈 PnL: €{pnl:.2f} ({pnl_pct:+.1f}%) | Held: {hours_held:.1f}h",
+        f"📊 Remaining: {position_qty:.2f} SUI | Daily P&L: €{daily_pnl:.2f}",
+        f"💰 Balance: €{balance_eur:.2f}"
+    ]
+    
+    if not AUTO_EXECUTE:
+        msg.append("(📝 Paper mode)")
         
-        # Take Profit 1 (sell more than before)
-        if price >= tp1_price and position_qty > 0:
-            sell_portion(price, SCALE_SELL["TP1"], f"🎯 TP1 reached +{TP1*100:.0f}%")
-            last_trade_candle = current_candle
-
-        # Take Profit 2 (sell most of remaining)
-        if price >= tp2_price and position_qty > 0:
-            sell_portion(price, SCALE_SELL["TP2"], f"🎯 TP2 reached +{TP2*100:.0f}%")
-            last_trade_candle = current_candle
-
-        # RSI Exit Logic (FIXED - no overlapping exits!)
-        if rsi >= 75 and position_qty > 0:
-            # FULL exit at RSI 75+ (highest priority)
-            sell_portion(price, 1.0, f"🚨 RSI full exit ({rsi:.1f} ≥ 75)")
-            last_trade_candle = current_candle
-        elif rsi >= 68 and position_qty > 0 and current_candle != last_trade_candle:
-            # Partial exit at RSI 68-74 (only if not already exited)
-            sell_portion(price, SCALE_SELL["RSI_WARNING"], f"⚠️ RSI warning exit ({rsi:.1f} ≥ 68)")
-            last_trade_candle = current_candle
-
-def execute_buy(price, rsi, portion, reason, is_deep_buy=False):
-    global in_position, entry_price, position_qty, balance_usdt, entry_time
+    send_alert("\n".join(msg))
+    global in_position, entry_price_eur, position_qty, balance_eur, entry_time
 
     if portion <= 0:
         return
@@ -281,55 +421,55 @@ def execute_buy(price, rsi, portion, reason, is_deep_buy=False):
     else:
         max_allowed = min(portion, MAX_POSITION_SIZE)  # Cap momentum buys at 15%
     
-    usdt_alloc = balance_usdt * max_allowed
+    eur_alloc = balance_eur * max_allowed
     
-    if usdt_alloc <= 10:  # Minimum trade size
+    if eur_alloc <= 10:  # Minimum trade size
         return
 
-    qty = usdt_alloc / price
+    qty = eur_alloc / price_eur
 
     if AUTO_EXECUTE:
-        balance_usdt -= usdt_alloc
+        balance_eur -= eur_alloc
 
     # Position tracking
     if in_position:
         # Average into position
-        new_total_value = (entry_price * position_qty) + (price * qty)
+        new_total_value = (entry_price_eur * position_qty) + (price_eur * qty)
         new_total_qty = position_qty + qty
-        entry_price = new_total_value / new_total_qty
+        entry_price_eur = new_total_value / new_total_qty
         position_qty = new_total_qty
     else:
-        entry_price = price
+        entry_price_eur = price_eur
         position_qty = qty
         in_position = True
         entry_time = time.time()
 
-    tp1_price = entry_price * (1 + TP1)
-    tp2_price = entry_price * (1 + TP2)
+    tp1_price = entry_price_eur * (1 + TP1)
+    tp2_price = entry_price_eur * (1 + TP2)
 
     msg = [
         f"✅ BUY — {reason}",
-        f"💰 Price: ${price:.4f} | RSI: {rsi:.1f}",
-        f"💵 Size: ${usdt_alloc:.2f} ({max_allowed*100:.0f}%) → {qty:.2f} SUI",
-        f"🎯 Targets: TP1 ${tp1_price:.4f} (+6%) | TP2 ${tp2_price:.4f} (+15%)",
+        f"💰 Price: €{price_eur:.4f} | RSI: {rsi:.1f}",
+        f"💵 Size: €{eur_alloc:.2f} ({max_allowed*100:.0f}%) → {qty:.2f} SUI",
+        f"🎯 Targets: TP1 €{tp1_price:.4f} (+6%) | TP2 €{tp2_price:.4f} (+15%)",
         f"🛡️ Exits: RSI 68 (30%), RSI 75 (100%), Extreme 80+ (100%)",
-        f"📊 Position: {position_qty:.2f} SUI @ ${entry_price:.4f}"
+        f"📊 Position: {position_qty:.2f} SUI @ €{entry_price_eur:.4f}"
     ]
     send_alert("\n".join(msg))
 
-def sell_portion(price, fraction, reason):
-    global in_position, position_qty, balance_usdt, entry_price, entry_time, daily_pnl
+def sell_portion(price_eur, fraction, reason):
+    global in_position, position_qty, balance_eur, entry_price_eur, entry_time, daily_pnl
 
     qty_to_sell = position_qty * fraction
     if qty_to_sell <= 0:
         return
 
-    proceeds = qty_to_sell * price
+    proceeds = qty_to_sell * price_eur
     if AUTO_EXECUTE:
-        balance_usdt += proceeds
+        balance_eur += proceeds
 
-    pnl = (price - entry_price) * qty_to_sell if entry_price else 0
-    pnl_pct = (price - entry_price) / entry_price * 100 if entry_price else 0
+    pnl = (price_eur - entry_price_eur) * qty_to_sell if entry_price_eur else 0
+    pnl_pct = (price_eur - entry_price_eur) / entry_price_eur * 100 if entry_price_eur else 0
     
     # Update daily P&L tracking
     daily_pnl += pnl
@@ -338,7 +478,7 @@ def sell_portion(price, fraction, reason):
     
     if position_qty <= 0.001:
         in_position = False
-        entry_price = None
+        entry_price_eur = None
         entry_time = None
         position_qty = 0
 
@@ -346,14 +486,35 @@ def sell_portion(price, fraction, reason):
 
     msg = [
         f"💸 SELL — {reason}",
-        f"💰 Price: ${price:.4f}",
-        f"📦 Sold: {qty_to_sell:.2f} SUI → ${proceeds:.2f}",
-        f"📈 PnL: ${pnl:.2f} ({pnl_pct:+.1f}%) | Held: {hours_held:.1f}h",
-        f"📊 Remaining: {position_qty:.2f} SUI | Daily P&L: ${daily_pnl:.2f}"
+        f"💰 Price: €{price_eur:.4f}",
+        f"📦 Sold: {qty_to_sell:.2f} SUI → €{proceeds:.2f}",
+        f"📈 PnL: €{pnl:.2f} ({pnl_pct:+.1f}%) | Held: {hours_held:.1f}h",
+        f"📊 Remaining: {position_qty:.2f} SUI | Daily P&L: €{daily_pnl:.2f}"
     ]
     
     if AUTO_EXECUTE:
-        msg.append(f"💰 Balance: ${balance_usdt:.2f}")
+        msg.append(f"💰 Balance: €{balance_eur:.2f}")
+    else:
+        msg.append("(📝 Paper mode)")
+        
+    send_alert("\n".join(msg))
+        in_position = False
+        entry_price_eur = None
+        entry_time = None
+        position_qty = 0
+
+    hours_held = (time.time() - entry_time) / 3600 if entry_time else 0
+
+    msg = [
+        f"💸 SELL — {reason}",
+        f"💰 Price: €{price_eur:.4f}",
+        f"📦 Sold: {qty_to_sell:.2f} SUI → €{proceeds:.2f}",
+        f"📈 PnL: €{pnl:.2f} ({pnl_pct:+.1f}%) | Held: {hours_held:.1f}h",
+        f"📊 Remaining: {position_qty:.2f} SUI | Daily P&L: €{daily_pnl:.2f}"
+    ]
+    
+    if AUTO_EXECUTE:
+        msg.append(f"💰 Balance: €{balance_eur:.2f}")
     else:
         msg.append("(📝 Paper mode)")
         
@@ -362,13 +523,14 @@ def sell_portion(price, fraction, reason):
 # === MAIN LOOP ===
 if __name__ == "__main__":
     startup_msg = [
-        f"🛡️ CRASH-PROTECTED SUI BOT STARTED (FIXED VERSION)",
-        f"📊 CURRENT POSITION: {position_qty:.4f} SUI @ €{entry_price:.4f}",
-        f"💰 Capital: €{START_FUNDS:.2f} FULLY DEPLOYED | Mode: {'LIVE' if AUTO_EXECUTE else 'PAPER'}",
-        f"🎯 Strategy: Deep ≤30 RSI (50%), Momentum ≤45 RSI (15% max)",
-        f"🔔 Alerts: RSI 40, 35, 32 monitoring + trade execution",
+        f"🛡️ EXTREME RSI STRATEGY BOT STARTED (EUR VERSION)",
+        f"📊 CURRENT POSITION: {position_qty:.4f} SUI @ €{entry_price_eur:.4f}",
+        f"💰 Capital: €{START_FUNDS:.2f} DEPLOYED | Balance: €{balance_eur:.2f} | Mode: {'LIVE' if AUTO_EXECUTE else 'PAPER'}",
+        f"💱 All prices converted to EUR automatically",
+        f"🎯 CORE STRATEGY: ALL-IN ≤30 RSI, ALL-OUT ≥70 RSI",
+        f"📈 Buy scaling: 100% ≤30, 25% @31-35, 15% @36-40, 10% @41-45",
+        f"📉 Sell scaling: 15% @55-60, 25% @61-65, 40% @66-69, 100% ≥70",
         f"🛡️ Protection: Daily -8% limit, Max -25% drawdown, Parabolic detection",
-        f"📈 Exits: TP1 6% (25%), TP2 15% (35%), RSI 68 (30%), RSI 75 (100%)",
         f"🚨 Emergency: RSI ≥80 (full exit)",
         f"🔄 Monitoring every {CHECK_INTERVAL/60:.0f} minutes"
     ]
