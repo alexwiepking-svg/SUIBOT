@@ -28,35 +28,36 @@ TP2 = 0.15              # 15% - this worked well
 ENABLE_BUBBLE_PROTECTION = True
 RSI_EXTREME_THRESHOLD = 80      # Extreme overbought - sell everything
 PARABOLIC_PROTECTION = True
-MAX_POSITION_SIZE = 0.15        # Never more than 15% per momentum buy
+MAX_POSITION_SIZE = 0.15        # Only applies to momentum buys now!
 DAILY_LOSS_LIMIT = 0.08         # Stop trading if down 8% in 24h
 MAX_DRAWDOWN_LIMIT = 0.25       # Emergency exit if down 25% from peak
 
 # Position sizing (much more conservative)
 SCALE_BUY = {
-    "deep": 0.50,           # Reduced from 75% - be more careful
-    "momentum": 0.15        # Reduced from 30% - way more conservative
+    "deep": 0.50,           # 50% for deep oversold - NOT capped by MAX_POSITION_SIZE
+    "momentum": 0.15        # 15% for momentum - capped by MAX_POSITION_SIZE
 }
 
 SCALE_SELL = {
-    "TP1": 0.40,           # Sell more at TP1 (was 25%)
-    "TP2": 0.60,           # Sell most at TP2 (was 70%)
-    "RSI_WARNING": 0.30,   # New: partial exit at RSI 68
-    "RSI_DANGER": 1.0      # Full exit at RSI 75 (not 70!)
+    "TP1": 0.25,           # Sell 25% at TP1 (6%) - reduced from 40%
+    "TP2": 0.35,           # Sell 35% at TP2 (15%) - reduced from 60%
+    "RSI_WARNING": 0.30,   # Sell 30% at RSI 68 (from deep oversold)
+    "RSI_DANGER": 1.0      # Full exit at RSI 75
 }
 
 EMA_SLOPE_LOOKBACK = 3
 
 # === STATE TRACKING ===
-balance_usdt = START_FUNDS
-in_position = False
-entry_price = None
-position_qty = 0.0
-entry_time = None
+balance_usdt = 0.0  # All funds deployed
+in_position = True
+entry_price = 409.64 / 142.2382  # €2.88 per SUI
+position_qty = 142.2382
+entry_time = time.time()  # Set to current time
 daily_pnl = 0.0
 daily_reset_time = time.time()
 peak_portfolio_value = START_FUNDS
 last_trade_candle = None
+last_alert_rsi_level = None  # Track last RSI alert to avoid spam
 
 # === HELPERS ===
 def send_alert(message):
@@ -143,6 +144,35 @@ def get_current_candle_id(df):
         return None
     return int(df.iloc[-1]["time"] / 1000)  # Convert to seconds
 
+def send_rsi_monitoring_alert(rsi, price):
+    """Send RSI monitoring alerts for key levels"""
+    global last_alert_rsi_level
+    
+    # Define alert levels
+    alert_levels = [40, 35, 32]  # RSI levels to alert on
+    
+    # Find the appropriate alert level
+    current_alert_level = None
+    for level in alert_levels:
+        if rsi <= level:
+            current_alert_level = level
+            break
+    
+    # Only send alert if we hit a new lower level
+    if current_alert_level and current_alert_level != last_alert_rsi_level:
+        if current_alert_level == 40:
+            send_alert(f"👀 RSI WATCH: {rsi:.1f} @ ${price:.4f} - Getting oversold")
+        elif current_alert_level == 35:
+            send_alert(f"⚠️ RSI ALERT: {rsi:.1f} @ ${price:.4f} - Approaching deep zone (≤30)")
+        elif current_alert_level == 32:
+            send_alert(f"🔥 RSI CRITICAL: {rsi:.1f} @ ${price:.4f} - Very close to deep buy zone!")
+        
+        last_alert_rsi_level = current_alert_level
+    
+    # Reset alert level if RSI rises above 45
+    if rsi > 45:
+        last_alert_rsi_level = None
+
 # === IMPROVED TRADE LOGIC ===
 def analyze(df):
     global in_position, entry_price, position_qty, balance_usdt, entry_time, daily_pnl, last_trade_candle
@@ -154,6 +184,11 @@ def analyze(df):
     ema = df["EMA"].iloc[-1]
     rsi = df["RSI"].iloc[-1]
     prev_rsi = df["RSI"].iloc[-2] if len(df) > 1 else rsi
+
+    # Send RSI monitoring alerts
+    # Reduced monitoring since we're already positioned
+    if position_qty < START_FUNDS * 0.8:  # Only alert if less than 80% positioned
+        send_rsi_monitoring_alert(rsi, price)
 
     # Get current candle ID to prevent multiple trades per candle
     current_candle = get_current_candle_id(df)
@@ -191,22 +226,22 @@ def analyze(df):
     else:
         ema_slope = 0
 
-    # === CONSERVATIVE BUY LOGIC ===
+    # === FIXED BUY LOGIC ===
     if current_candle != last_trade_candle:  # One trade per candle
         
-        # Full buy in deep oversold (RSI ≤ 30)
+        # DEEP OVERSOLD BUY (RSI ≤ 30) - FULL 50% allocation, no MAX_POSITION_SIZE cap
         if rsi <= BUY_ZONE_DEEP and not is_parabolic:
-            execute_buy(price, rsi, SCALE_BUY["deep"], "🔥 Deep oversold entry (RSI ≤30)")
+            execute_buy(price, rsi, SCALE_BUY["deep"], "🔥 Deep oversold entry (RSI ≤30)", is_deep_buy=True)
             last_trade_candle = current_candle
         
-        # MUCH more conservative momentum buy (RSI 30-45, not 30-55!)
+        # MOMENTUM BUY (RSI 30-45) - Capped at 15% by MAX_POSITION_SIZE
         elif (BUY_ZONE_DEEP < rsi <= BUY_ZONE_MOMENTUM and 
               price > ema and ema_slope > 0 and not is_parabolic):
             # Additional safety: reduce size if RSI is higher in the range
             size_multiplier = max(0.5, (BUY_ZONE_MOMENTUM - rsi) / (BUY_ZONE_MOMENTUM - BUY_ZONE_DEEP))
             adjusted_size = SCALE_BUY["momentum"] * size_multiplier
             
-            execute_buy(price, rsi, adjusted_size, f"📈 Conservative momentum ({rsi:.1f}, size: {adjusted_size*100:.0f}%)")
+            execute_buy(price, rsi, adjusted_size, f"📈 Conservative momentum ({rsi:.1f}, size: {adjusted_size*100:.0f}%)", is_deep_buy=False)
             last_trade_candle = current_candle
 
     # === IMPROVED SELL LOGIC ===
@@ -234,14 +269,18 @@ def analyze(df):
             sell_portion(price, SCALE_SELL["RSI_WARNING"], f"⚠️ RSI warning exit ({rsi:.1f} ≥ 68)")
             last_trade_candle = current_candle
 
-def execute_buy(price, rsi, portion, reason):
+def execute_buy(price, rsi, portion, reason, is_deep_buy=False):
     global in_position, entry_price, position_qty, balance_usdt, entry_time
 
     if portion <= 0:
         return
 
-    # Additional position size limits
-    max_allowed = min(portion, MAX_POSITION_SIZE)
+    # FIXED: Only apply MAX_POSITION_SIZE to momentum buys, not deep buys
+    if is_deep_buy:
+        max_allowed = portion  # Allow full 50% for deep oversold buys
+    else:
+        max_allowed = min(portion, MAX_POSITION_SIZE)  # Cap momentum buys at 15%
+    
     usdt_alloc = balance_usdt * max_allowed
     
     if usdt_alloc <= 10:  # Minimum trade size
@@ -323,13 +362,14 @@ def sell_portion(price, fraction, reason):
 # === MAIN LOOP ===
 if __name__ == "__main__":
     startup_msg = [
-        f"🛡️ CRASH-PROTECTED SUI BOT STARTED",
-        f"📊 Lessons learned from 2025 failure applied!",
-        f"💰 Capital: ${START_FUNDS:.2f} | Mode: {'LIVE' if AUTO_EXECUTE else 'PAPER'}",
-        f"🎯 Conservative: Deep buy ≤30 RSI, Momentum ≤45 RSI (was 55)",
+        f"🛡️ CRASH-PROTECTED SUI BOT STARTED (FIXED VERSION)",
+        f"📊 CURRENT POSITION: {position_qty:.4f} SUI @ €{entry_price:.4f}",
+        f"💰 Capital: €{START_FUNDS:.2f} FULLY DEPLOYED | Mode: {'LIVE' if AUTO_EXECUTE else 'PAPER'}",
+        f"🎯 Strategy: Deep ≤30 RSI (50%), Momentum ≤45 RSI (15% max)",
+        f"🔔 Alerts: RSI 40, 35, 32 monitoring + trade execution",
         f"🛡️ Protection: Daily -8% limit, Max -25% drawdown, Parabolic detection",
-        f"📈 Exits: TP1 6% (40%), TP2 15% (60%), RSI 68 (30%), RSI 75 (100%)",
-        f"🚨 Emergency: RSI ≥80 (full exit), Max 15% per momentum trade",
+        f"📈 Exits: TP1 6% (25%), TP2 15% (35%), RSI 68 (30%), RSI 75 (100%)",
+        f"🚨 Emergency: RSI ≥80 (full exit)",
         f"🔄 Monitoring every {CHECK_INTERVAL/60:.0f} minutes"
     ]
     send_alert("\n".join(startup_msg))
