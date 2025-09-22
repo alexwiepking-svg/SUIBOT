@@ -1,3 +1,8 @@
+# Backup the broken file
+cp sui_rsi_bot.py sui_rsi_bot_broken.py
+
+# Create a completely new clean file
+cat > sui_rsi_bot.py << 'EOF'
 import ccxt
 import pandas as pd
 import pandas_ta as ta
@@ -68,7 +73,6 @@ peak_portfolio_value = START_FUNDS
 last_trade_candle = None
 last_alert_rsi_level = None  # Track last RSI alert to avoid spam
 
-# === HELPERS ===
 def get_eur_usd_rate():
     """Fetch current EUR/USD exchange rate"""
     try:
@@ -94,6 +98,8 @@ def eur_to_usd(eur_amount):
     if EUR_USD_RATE is None:
         EUR_USD_RATE = get_eur_usd_rate()
     return eur_amount * EUR_USD_RATE
+
+def send_alert(message):
     tag = "[SUI CRASH-PROTECTED]"
     full_msg = f"{tag} {message}"
     print(full_msg)
@@ -109,6 +115,18 @@ def fetch_data():
     df["close"] = df["close"].astype(float)
     df["high"] = df["high"].astype(float)
     df["low"] = df["low"].astype(float)
+    
+    # Convert all prices to EUR
+    global EUR_USD_RATE
+    if EUR_USD_RATE is None:
+        EUR_USD_RATE = get_eur_usd_rate()
+        send_alert(f"💱 EUR/USD rate: {EUR_USD_RATE:.4f}")
+    
+    df["close"] = df["close"].apply(usd_to_eur)
+    df["high"] = df["high"].apply(usd_to_eur)
+    df["low"] = df["low"].apply(usd_to_eur)
+    df["open"] = df["open"].apply(usd_to_eur)
+    
     return df
 
 def detect_parabolic_move(df):
@@ -216,32 +234,36 @@ def get_sell_allocation(rsi, position_remaining):
         return allocation, f"📉 Light scale-out (RSI {rsi:.1f})"
     else:
         return 0, ""
+
+def send_rsi_monitoring_alert(rsi, price_eur):
     """Send RSI monitoring alerts for key levels"""
     global last_alert_rsi_level
     
-    # Define alert levels
-    alert_levels = [40, 35, 32]  # RSI levels to alert on
+    # Define alert levels for the new strategy
+    alert_levels = [75, 70, 65, 60, 55, 45, 40, 35, 30, 25]
     
     # Find the appropriate alert level
     current_alert_level = None
     for level in alert_levels:
-        if rsi <= level:
+        if (level >= 70 and rsi >= level) or (level <= 45 and rsi <= level):
             current_alert_level = level
             break
     
-    # Only send alert if we hit a new lower level
+    # Only send alert if we hit a new level
     if current_alert_level and current_alert_level != last_alert_rsi_level:
-        if current_alert_level == 40:
-            send_alert(f"👀 RSI WATCH: {rsi:.1f} @ €{price_eur:.4f} - Getting oversold")
-        elif current_alert_level == 35:
-            send_alert(f"⚠️ RSI ALERT: {rsi:.1f} @ €{price_eur:.4f} - Approaching deep zone (≤30)")
-        elif current_alert_level == 32:
-            send_alert(f"🔥 RSI CRITICAL: {rsi:.1f} @ €{price_eur:.4f} - Very close to deep buy zone!")
+        if current_alert_level >= 70:
+            send_alert(f"🚨 RSI EXTREME: {rsi:.1f} @ €{price_eur:.4f} - SELL ZONE ACTIVATED!")
+        elif current_alert_level >= 55:
+            send_alert(f"⚠️ RSI HIGH: {rsi:.1f} @ €{price_eur:.4f} - Scaling out zone")
+        elif current_alert_level <= 30:
+            send_alert(f"🔥 RSI EXTREME: {rsi:.1f} @ €{price_eur:.4f} - BUY ZONE ACTIVATED!")
+        elif current_alert_level <= 45:
+            send_alert(f"👀 RSI LOW: {rsi:.1f} @ €{price_eur:.4f} - Scaling in zone")
         
         last_alert_rsi_level = current_alert_level
     
-    # Reset alert level if RSI rises above 45
-    if rsi > 45:
+    # Reset alert level if RSI is in neutral zone (46-54)
+    if 46 <= rsi <= 54:
         last_alert_rsi_level = None
 
 # === IMPROVED TRADE LOGIC ===
@@ -269,13 +291,13 @@ def analyze(df):
     # 1. Daily loss limit
     if check_daily_limits():
         if in_position:
-            sell_portion(price, 1.0, "🛑 Daily loss limit - emergency exit")
+            sell_scaled_portion(price_eur, position_qty, "🛑 Daily loss limit - emergency exit")
         return
     
     # 2. Maximum drawdown limit
     if check_drawdown_limit(current_portfolio_value):
         if in_position:
-            sell_portion(price, 1.0, "🚨 Max drawdown limit - emergency exit")
+            sell_scaled_portion(price_eur, position_qty, "🚨 Max drawdown limit - emergency exit")
         return
     
     # 3. Detect parabolic moves
@@ -285,7 +307,7 @@ def analyze(df):
     
     # 4. Extreme RSI protection
     if rsi >= RSI_EXTREME_THRESHOLD and in_position:
-        sell_portion(price_eur, 1.0, f"🚨 EXTREME RSI EXIT ({rsi:.1f} ≥ {RSI_EXTREME_THRESHOLD})")
+        sell_scaled_portion(price_eur, position_qty, f"🚨 EXTREME RSI EXIT ({rsi:.1f} ≥ {RSI_EXTREME_THRESHOLD})")
         return
 
     # EMA slope calculation
@@ -410,76 +432,6 @@ def sell_scaled_portion(price_eur, qty_to_sell, reason):
         msg.append("(📝 Paper mode)")
         
     send_alert("\n".join(msg))
-    global in_position, entry_price_eur, position_qty, balance_eur, entry_time
-
-    if portion <= 0:
-        return
-
-    # FIXED: Only apply MAX_POSITION_SIZE to momentum buys, not deep buys
-    if is_deep_buy:
-        max_allowed = portion  # Allow full 50% for deep oversold buys
-    else:
-        max_allowed = min(portion, MAX_POSITION_SIZE)  # Cap momentum buys at 15%
-    
-    eur_alloc = balance_eur * max_allowed
-    
-    if eur_alloc <= 10:  # Minimum trade size
-        return
-
-    qty = eur_alloc / price_eur
-
-    if AUTO_EXECUTE:
-        balance_eur -= eur_alloc
-
-    # Position tracking
-    if in_position:
-        # Average into position
-        new_total_value = (entry_price_eur * position_qty) + (price_eur * qty)
-        new_total_qty = position_qty + qty
-        entry_price_eur = new_total_value / new_total_qty
-        position_qty = new_total_qty
-    else:
-        entry_price_eur = price_eur
-        position_qty = qty
-        in_position = True
-        entry_time = time.time()
-
-    tp1_price = entry_price_eur * (1 + TP1)
-    tp2_price = entry_price_eur * (1 + TP2)
-
-    msg = [
-        f"✅ BUY — {reason}",
-        f"💰 Price: €{price_eur:.4f} | RSI: {rsi:.1f}",
-        f"💵 Size: €{eur_alloc:.2f} ({max_allowed*100:.0f}%) → {qty:.2f} SUI",
-        f"🎯 Targets: TP1 €{tp1_price:.4f} (+6%) | TP2 €{tp2_price:.4f} (+15%)",
-        f"🛡️ Exits: RSI 68 (30%), RSI 75 (100%), Extreme 80+ (100%)",
-        f"📊 Position: {position_qty:.2f} SUI @ €{entry_price_eur:.4f}"
-    ]
-    send_alert("\n".join(msg))
-
-# This function was removed and replaced with sell_scaled_portion above
-# Keeping this comment as placeholder to maintain line numbering
-        in_position = False
-        entry_price_eur = None
-        entry_time = None
-        position_qty = 0
-
-    hours_held = (time.time() - entry_time) / 3600 if entry_time else 0
-
-    msg = [
-        f"💸 SELL — {reason}",
-        f"💰 Price: €{price_eur:.4f}",
-        f"📦 Sold: {qty_to_sell:.2f} SUI → €{proceeds:.2f}",
-        f"📈 PnL: €{pnl:.2f} ({pnl_pct:+.1f}%) | Held: {hours_held:.1f}h",
-        f"📊 Remaining: {position_qty:.2f} SUI | Daily P&L: €{daily_pnl:.2f}"
-    ]
-    
-    if AUTO_EXECUTE:
-        msg.append(f"💰 Balance: €{balance_eur:.2f}")
-    else:
-        msg.append("(📝 Paper mode)")
-        
-    send_alert("\n".join(msg))
 
 # === MAIN LOOP ===
 if __name__ == "__main__":
@@ -505,3 +457,7 @@ if __name__ == "__main__":
             send_alert(f"❌ Error: {e}")
             print(f"Error: {e}")
         time.sleep(CHECK_INTERVAL)
+EOF
+
+# Test the new clean file
+python3 sui_rsi_bot.py
