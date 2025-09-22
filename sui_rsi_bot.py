@@ -452,4 +452,3 @@ if __name__ == "__main__":
             send_alert(f"❌ Error: {e}")
             print(f"Error: {e}")
         time.sleep(CHECK_INTERVAL)
-EOF
