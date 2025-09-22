@@ -453,6 +453,3 @@ if __name__ == "__main__":
             print(f"Error: {e}")
         time.sleep(CHECK_INTERVAL)
 EOF
-
-# Test the new clean file
-python3 sui_rsi_bot.py
