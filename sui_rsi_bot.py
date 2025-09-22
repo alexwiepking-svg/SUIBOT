@@ -457,47 +457,8 @@ def sell_scaled_portion(price_eur, qty_to_sell, reason):
     ]
     send_alert("\n".join(msg))
 
-def sell_portion(price_eur, fraction, reason):
-    global in_position, position_qty, balance_eur, entry_price_eur, entry_time, daily_pnl
-
-    qty_to_sell = position_qty * fraction
-    if qty_to_sell <= 0:
-        return
-
-    proceeds = qty_to_sell * price_eur
-    if AUTO_EXECUTE:
-        balance_eur += proceeds
-
-    pnl = (price_eur - entry_price_eur) * qty_to_sell if entry_price_eur else 0
-    pnl_pct = (price_eur - entry_price_eur) / entry_price_eur * 100 if entry_price_eur else 0
-    
-    # Update daily P&L tracking
-    daily_pnl += pnl
-
-    position_qty -= qty_to_sell
-    
-    if position_qty <= 0.001:
-        in_position = False
-        entry_price_eur = None
-        entry_time = None
-        position_qty = 0
-
-    hours_held = (time.time() - entry_time) / 3600 if entry_time else 0
-
-    msg = [
-        f"💸 SELL — {reason}",
-        f"💰 Price: €{price_eur:.4f}",
-        f"📦 Sold: {qty_to_sell:.2f} SUI → €{proceeds:.2f}",
-        f"📈 PnL: €{pnl:.2f} ({pnl_pct:+.1f}%) | Held: {hours_held:.1f}h",
-        f"📊 Remaining: {position_qty:.2f} SUI | Daily P&L: €{daily_pnl:.2f}"
-    ]
-    
-    if AUTO_EXECUTE:
-        msg.append(f"💰 Balance: €{balance_eur:.2f}")
-    else:
-        msg.append("(📝 Paper mode)")
-        
-    send_alert("\n".join(msg))
+# This function was removed and replaced with sell_scaled_portion above
+# Keeping this comment as placeholder to maintain line numbering
         in_position = False
         entry_price_eur = None
         entry_time = None
