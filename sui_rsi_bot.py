@@ -1,8 +1,3 @@
-# Backup the broken file
-cp sui_rsi_bot.py sui_rsi_bot_broken.py
-
-# Create a completely new clean file
-cat > sui_rsi_bot.py << 'EOF'
 import ccxt
 import pandas as pd
 import pandas_ta as ta
