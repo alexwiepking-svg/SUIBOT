@@ -1,0 +1,4 @@
+cd C:\Users\alex_\sui_rsi_bot
+venv\Scripts\activate
+
+py sui_rsi_bot.py
